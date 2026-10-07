@@ -28,7 +28,12 @@ dependencies = [
     # exist below 1.25.2 nor accept `file_path` below 1.27, and 1.27-1.29 panic
     # inside the streaming parquet reader. 1.30.0 is the lowest version on which
     # tests/test_polars_streaming.py and tests/test_analytics.py are green.
-    "polars>=1.30.0",
+    # Ceiling <2: polars 2.0 numbers the columns of a headerless CSV from 0
+    # (column_0) instead of 1, which renames every column of such sources and
+    # breaks their metric history, and it drops String->Date casting that the
+    # packs rely on. CI installs with pip, not from uv.lock, so without the
+    # ceiling it picked 2.0.0 up the day it shipped. Lift it with a migration.
+    "polars>=1.30.0,<2",
     "sqlalchemy>=2.0.27",
     "pyarrow>=19.0.0",
     "openpyxl>=3.1.2",

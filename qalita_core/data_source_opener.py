@@ -31,7 +31,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
@@ -119,6 +119,20 @@ class DataSource(ABC):
         return existing
 
     @property
+    def borrowed_paths(self) -> Set[str]:
+        """Paths handed back as-is instead of staged: the user's own files.
+
+        A parquet file is already the staging format, so it is returned
+        without a copy. Those paths belong to the source, not to the pack run:
+        ``Pack.cleanup`` must never delete them.
+        """
+        existing = getattr(self, "_borrowed_paths", None)
+        if existing is None:
+            existing = set()
+            self._borrowed_paths = existing
+        return existing
+
+    @property
     def skipped_objects(self) -> List[Dict[str, str]]:
         """Objects skipped by the current multi-object scan."""
         existing = getattr(self, "_skipped_objects", None)
@@ -186,9 +200,14 @@ class DataSource(ABC):
         registry[candidate] = identifier
         return candidate
 
-    def _record_object(self, name: str, paths: List[str]) -> List[str]:
+    def _record_object(
+        self, name: str, paths: List[str], staged: bool = True
+    ) -> List[str]:
+        """Record an object's parts; ``staged=False`` marks borrowed paths."""
         if paths:
             self.object_paths.setdefault(name, []).extend(paths)
+            if not staged:
+                self.borrowed_paths.update(paths)
         return paths
 
 
@@ -816,7 +835,14 @@ class FileSource(DataSource):
             f"The path {self.file_path} is neither a file nor a directory, or it can't be reached."
         )
 
-    def _load_file(self, file_path, pack_config, output_dir: str) -> List[str]:
+    def _load_file(
+        self,
+        file_path,
+        pack_config,
+        output_dir: str,
+        identifier: Optional[str] = None,
+    ) -> List[str]:
+        """Stage one file; ``identifier`` names the object (default: stem)."""
         skiprows = 0
         chunk_rows = _chunk_rows(pack_config)
         if pack_config:
@@ -825,13 +851,14 @@ class FileSource(DataSource):
             )
 
         base_name = self._object_base_name(
-            "file", os.path.splitext(os.path.basename(file_path))[0]
+            "file",
+            identifier or os.path.splitext(os.path.basename(file_path))[0],
         )
         lower = file_path.lower()
 
         # Parquet is already the staging format: no copy, no conversion.
         if lower.endswith((".parquet", ".pq")):
-            return self._record_object(base_name, [file_path])
+            return self._record_object(base_name, [file_path], staged=False)
 
         # Text formats stage to roughly a fifth to a half of their own size
         # once zstd is applied; 0.6 keeps the guard on the safe side of that
@@ -1231,7 +1258,7 @@ def _materialize_remote_to_parquet(
     )
 
     if fmt == "parquet" and not storage_options:
-        return source._record_object(base_name, [path])
+        return source._record_object(base_name, [path], staged=False)
 
     # Polars scans s3/gs/abfs/http in place; anything else (HDFS above all) has
     # to come through fsspec, which streams it to a local file first.
@@ -1495,12 +1522,188 @@ class HDFSSource(DataSource):
         )
 
 
-class FolderSource(DataSource):
+FOLDER_DATA_SUFFIXES = (
+    ".csv",
+    ".xlsx",
+    ".xlsm",
+    ".parquet",
+    ".pq",
+    ".json",
+    ".ndjson",
+    ".jsonl",
+)
+
+
+class FolderSource(FileSource):
+    """A directory of data files: one logical object per file.
+
+    The folder counterpart of a database scanned with ``*``. Every file is
+    staged by :meth:`FileSource._load_file`, so it reads exactly the formats
+    and CSV options a single-file source does, and a parquet file is read in
+    place (borrowed, never deleted by ``Pack.cleanup``).
+
+    Config: ``path`` (the directory), ``recursive`` (default ``False``; nested
+    files are then named after their relative path, ``2024/visits`` ->
+    ``file_2024_visits``), plus the CSV options of a file source. Hidden files
+    and directories and Excel lock files (``~$...``) are ignored.
+
+    ``table_or_query`` selects files: ``None`` or ``"*"`` for all of them, a
+    name or a list of names otherwise. A name is the file's identifier with or
+    without its extension, case-insensitively.
+
+    In a scan of several files, a file that cannot be read is skipped and
+    recorded in ``skipped_objects``, as a database scan skips a table it cannot
+    read; a full disk still aborts, and so does a scan where nothing could be
+    read. A file named explicitly raises its own error.
+    """
+
     def __init__(self, config):
-        self.config = config
+        config = config or {}
+        super().__init__(config.get("path"), config)
+
+    def _data_files(self) -> Dict[str, str]:
+        """Identifier -> file path, sorted.
+
+        The identifier is the relative path without its suffix, unless two
+        files share it (``visits.csv`` and ``visits.parquet``): both then keep
+        their suffix, rather than one silently replacing the other.
+        """
+        root = Path(self.file_path)
+        recursive = _config_flag(self.config.get("recursive"), default=False)
+        candidates = []
+        for path in sorted(root.glob("**/*" if recursive else "*")):
+            relative = path.relative_to(root)
+            if (
+                path.is_file()
+                and path.suffix.lower() in FOLDER_DATA_SUFFIXES
+                and not any(part.startswith(".") for part in relative.parts)
+                and not path.name.startswith("~$")
+            ):
+                candidates.append(relative)
+        stems = [
+            relative.with_suffix("").as_posix() for relative in candidates
+        ]
+        return {
+            (stem if stems.count(stem) == 1 else relative.as_posix()): str(
+                root / relative
+            )
+            for stem, relative in zip(stems, candidates)
+        }
+
+    def _select(self, files: Dict[str, str], table_or_query) -> Dict[str, str]:
+        root = Path(self.file_path)
+        if table_or_query is None or (
+            isinstance(table_or_query, str) and table_or_query.strip() == "*"
+        ):
+            return files
+        if isinstance(table_or_query, str):
+            names = [table_or_query]
+        elif isinstance(table_or_query, (list, tuple, set)):
+            names = list(table_or_query)
+        else:
+            raise TypeError(
+                "table_or_query must be None, '*', a file name, or a list of "
+                "file names."
+            )
+
+        # A file answers to its identifier and to its relative file name,
+        # extension included, case-insensitively.
+        lookup = {}
+        for identifier, path in files.items():
+            lookup.setdefault(identifier.lower(), identifier)
+            lookup.setdefault(
+                Path(path).relative_to(root).as_posix().lower(), identifier
+            )
+        selected = {}
+        for name in names:
+            identifier = lookup.get(str(name).strip().lower())
+            if identifier is None:
+                raise FileNotFoundError(
+                    f"No data file named {name!r} in the folder; available: "
+                    f"{', '.join(files)}"
+                )
+            selected[identifier] = files[identifier]
+        return selected
 
     def get_data(self, table_or_query=None, pack_config=None):
-        raise NotImplementedError("FolderSource.get_data Not yet Implemented.")
+        if not self.file_path or not os.path.isdir(self.file_path):
+            raise FileNotFoundError(
+                f"Folder source path {self.file_path!r} is not a directory, "
+                "or it can't be reached."
+            )
+        files = self._data_files()
+        if not files:
+            raise FileNotFoundError(
+                f"No data file ({', '.join(FOLDER_DATA_SUFFIXES)}) in "
+                f"{self.file_path}."
+            )
+        selected = self._select(files, table_or_query)
+        explicit = not (
+            table_or_query is None
+            or (
+                isinstance(table_or_query, str)
+                and table_or_query.strip() == "*"
+            )
+        )
+        output_dir = _ensure_output_dir(pack_config)
+
+        self._skipped_objects = []
+        all_paths: List[str] = []
+        read_count = 0
+        skipped: List[Dict[str, str]] = []
+        first_error: Optional[BaseException] = None
+        for identifier, path in selected.items():
+            try:
+                if path.lower().endswith((".parquet", ".pq")):
+                    # Read in place, so nothing else would open it before the
+                    # pack does: check the footer now, while a bad file can
+                    # still be skipped instead of failing the analysis.
+                    pl.read_parquet_schema(path)
+                all_paths.extend(
+                    self._load_file(path, pack_config, output_dir, identifier)
+                )
+            except InsufficientDiskSpaceError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a bad file is skipped
+                if explicit:
+                    raise
+                reason = " ".join(str(exc).split()) or exc.__class__.__name__
+                skipped.append(
+                    {
+                        "object": os.path.relpath(path, self.file_path),
+                        "error": exc.__class__.__name__,
+                        "reason": reason,
+                    }
+                )
+                if first_error is None:
+                    first_error = exc
+                logger.warning(
+                    "skipping %s: it could not be read (%s: %s)",
+                    path,
+                    exc.__class__.__name__,
+                    reason,
+                )
+            else:
+                read_count += 1
+
+        if skipped:
+            self.skipped_objects.extend(skipped)
+            if not read_count:
+                details = "; ".join(
+                    f"{item['object']} ({item['error']}: {item['reason']})"
+                    for item in skipped
+                )
+                raise RuntimeError(
+                    f"None of the {len(skipped)} files in the folder could be "
+                    f"read: {details}"
+                ) from first_error
+            logger.warning(
+                "%d of %d files were skipped and are absent from this scan: %s",
+                len(skipped),
+                len(skipped) + read_count,
+                ", ".join(item["object"] for item in skipped),
+            )
+        return all_paths
 
 
 class MongoDBSource(DataSource):
@@ -1916,6 +2119,7 @@ class RedshiftSource(DataSource):
             table_or_query=table_or_query, pack_config=pack_config
         )
         self._object_paths = db_source.object_paths
+        self._borrowed_paths = set(getattr(db_source, "borrowed_paths", ()))
         self._skipped_objects = [
             dict(item) for item in db_source.skipped_objects
         ]

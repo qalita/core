@@ -718,6 +718,131 @@ class TestPackCleanup:
         assert removed2 == 0
 
 
+def _pack_for(tmp_path, source_config):
+    """A Pack whose source is ``source_config``, staging under tmp_path."""
+    pack_conf = tmp_path / "pack_conf.json"
+    pack_conf.write_text(
+        json.dumps({"job": {"parquet_output_dir": str(tmp_path / "staged")}})
+    )
+    source_conf = tmp_path / "source_conf.json"
+    source_conf.write_text(json.dumps(source_config))
+    return Pack(
+        configs={
+            "pack_conf": str(pack_conf),
+            "source_conf": str(source_conf),
+            "target_conf": str(tmp_path / "absent_target_conf.json"),
+            "agent_file": str(tmp_path / "absent_agent"),
+        }
+    )
+
+
+class TestCleanupNeverTouchesSourceFiles:
+    """Cleanup removes what load_data staged -- and nothing else.
+
+    A parquet file source is not staged: load_data hands back the user's own
+    file. Cleanup used to delete everything in paths_source, so every pack run
+    on a parquet file destroyed the source it had just analysed.
+    """
+
+    def test_parquet_file_source_survives_the_pack(self, tmp_path):
+        source = tmp_path / "patients.parquet"
+        pl.DataFrame({"id": [1, 2]}).write_parquet(source)
+
+        with _pack_for(
+            tmp_path, {"type": "file", "config": {"path": str(source)}}
+        ) as pack:
+            assert pack.load_data("source") == [str(source)]
+
+        assert source.exists()
+        assert pl.read_parquet(source)["id"].to_list() == [1, 2]
+
+    def test_cleanup_reports_nothing_removed_for_a_parquet_source(
+        self, tmp_path
+    ):
+        source = tmp_path / "patients.parquet"
+        pl.DataFrame({"id": [1]}).write_parquet(source)
+        pack = _pack_for(
+            tmp_path, {"type": "file", "config": {"path": str(source)}}
+        )
+        pack.load_data("source")
+        assert pack.cleanup() == 0
+        assert source.exists()
+
+    def test_csv_source_kept_and_its_staged_parts_removed(self, tmp_path):
+        source = tmp_path / "patients.csv"
+        source.write_text("id\n1\n2\n")
+
+        with _pack_for(
+            tmp_path, {"type": "file", "config": {"path": str(source)}}
+        ) as pack:
+            staged = pack.load_data("source")
+            assert staged and all(os.path.exists(p) for p in staged)
+
+        assert source.exists()
+        assert not any(os.path.exists(p) for p in staged)
+
+
+class TestCleanupCoversEveryLoad:
+    """A pack loading table by table calls load_data once per table.
+
+    paths_source only holds the last call's parts (packs read it as "what I
+    just loaded"), so cleanup must not rely on it: every earlier table's
+    parts used to be left on disk.
+    """
+
+    def test_parts_of_every_load_data_call_are_removed(self, tmp_path):
+        import sqlite3
+
+        database = tmp_path / "warehouse.db"
+        with sqlite3.connect(database) as connection:
+            connection.execute("create table a (x integer)")
+            connection.execute("insert into a values (1)")
+            connection.execute("create table b (y integer)")
+            connection.execute("insert into b values (2)")
+
+        with _pack_for(
+            tmp_path,
+            {
+                "type": "sqlite",
+                "config": {"connection_string": f"sqlite:///{database}"},
+            },
+        ) as pack:
+            first = pack.load_data("source", table_or_query="a")
+            second = pack.load_data("source", table_or_query="b")
+            assert pack.paths_source == second  # last call, as before
+            staged = first + second
+            assert all(os.path.exists(p) for p in staged)
+
+        assert not any(os.path.exists(p) for p in staged)
+        assert database.exists()
+
+
+class TestFolderSourceThroughPack:
+    """A folder is a multi-object source, like a database scanned with *."""
+
+    def test_tables_scan_and_cleanup(self, tmp_path):
+        folder = tmp_path / "warehouse"
+        folder.mkdir()
+        (folder / "patients.csv").write_text("id\n1\n2\n")
+        stays = folder / "stays.parquet"
+        pl.DataFrame({"stay": [10]}).write_parquet(stays)
+
+        with _pack_for(
+            tmp_path, {"type": "folder", "config": {"path": str(folder)}}
+        ) as pack:
+            pack.load_data("source")
+            assert sorted(pack.tables("source")) == [
+                "file_patients",
+                "file_stays",
+            ]
+            assert pack.get_row_count("source", "file_patients") == 2
+            assert pack.schema("source", "file_stays") == {"stay": pl.Int64}
+            staged = pack.objects_source["file_patients"]
+
+        assert stays.exists() and (folder / "patients.csv").exists()
+        assert not any(os.path.exists(p) for p in staged)
+
+
 class TestObjectKey:
     """Tests for the _object_key helper."""
 

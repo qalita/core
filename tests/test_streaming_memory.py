@@ -51,6 +51,7 @@ from pathlib import Path
 import pytest
 
 from tests.bigdata import (  # noqa: F401 - imported for pytest fixture lookup
+    DEFAULT_PARTS,
     Dataset,
     bigdata,
     dataset_rows,
@@ -302,9 +303,24 @@ def measure(operation: str, dataset: Dataset, tmp_path: Path) -> Measurement:
 
 @pytest.fixture(scope="session")
 def quarter_dataset(tmp_path_factory) -> Dataset:
-    """A quarter of the main dataset, for the growth comparison."""
+    """A quarter of the main dataset, for the growth comparison.
+
+    A quarter of the *parts*, each the same size as the main dataset's: the
+    growth tests vary the row count and nothing else, the way staged data
+    grows (more parts of ``chunk_rows``, not bigger ones). This used to be
+    four parts of half the size, which also halved the rows per file. Peak RSS
+    of a multi-file scan depends on that layout -- polars 1.44 prefetches
+    across files, measured at 16M rows: 30 MiB in 64 files, 105 in 2, 128 in
+    8 -- so the comparison charged the layout change to the row count, and
+    `approx_n_unique` sat at x2.2-2.8 around GROWTH_LIMIT, failing at random
+    in CI (pip installs the newest polars, the lock does not).
+    """
     root = tmp_path_factory.mktemp("qalita-bigdata-quarter")
-    return generate(root, rows=max(dataset_rows() // 4, 100_000), parts=4)
+    return generate(
+        root,
+        rows=max(dataset_rows() // 4, 100_000),
+        parts=max(DEFAULT_PARTS // 4, 1),
+    )
 
 
 # --------------------------------------------------------------------------
