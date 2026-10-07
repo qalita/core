@@ -57,6 +57,11 @@ jobs:
         continue-on-error: true
         run: python tests/test_no_eager_reads.py qalita_core --show-waivers
 
+  # Installs from uv.lock: a PR is tested against the dependencies it pins, so
+  # it goes red because of its own changes only. Installing with pip resolved
+  # the newest releases instead, and on 2026-10-07 polars 2.0.0, then 1.44.2,
+  # broke unrelated PRs the day they shipped. Dependency moves now arrive
+  # through dependabot's uv.lock PRs, where this job tests them.
   test:
     name: Pytest - Unit Tests
     runs-on: ubuntu-latest
@@ -66,14 +71,37 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Setup Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      # --frozen: fail if uv.lock no longer matches pyproject.toml rather than
+      # silently re-resolving.
+      - name: Install dependencies from uv.lock
+        run: uv sync --frozen --extra dev
+      - name: Run tests with pytest
+        run: uv run --frozen pytest tests/ -v --tb=short
+
+  # What a `pip install qalita-core` user gets: the newest release of every
+  # dependency within the declared ranges. Advisory: it reports upcoming
+  # breakage early without blocking a PR that did not cause it.
+  test-latest:
+    name: Pytest - Latest dependencies (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install the newest dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install --upgrade -e ".[dev]"
       - name: Run tests with pytest
         run: pytest tests/ -v --tb=short
 
