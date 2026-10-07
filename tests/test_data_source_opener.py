@@ -185,6 +185,43 @@ class TestFileSource:
             source.get_data()
 
 
+class TestBorrowedPaths:
+    """Paths handed back unstaged are flagged so cleanup never deletes them."""
+
+    def test_parquet_file_is_borrowed(self, tmp_path):
+        parquet_path = tmp_path / "test.parquet"
+        pl.DataFrame({"a": [1]}).write_parquet(parquet_path)
+        source = FileSource(str(parquet_path))
+        paths = source.get_data(
+            pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+        assert paths == [str(parquet_path)]
+        assert source.borrowed_paths == {str(parquet_path)}
+
+    def test_staged_csv_parts_are_not_borrowed(self, tmp_path):
+        csv_path = tmp_path / "test.csv"
+        csv_path.write_text("a\n1\n")
+        source = FileSource(str(csv_path))
+        paths = source.get_data(
+            pack_config={"parquet_output_dir": str(tmp_path / "out")}
+        )
+        assert paths and source.borrowed_paths == set()
+
+    def test_remote_parquet_read_in_place_is_borrowed(self, tmp_path):
+        parquet_path = tmp_path / "remote.parquet"
+        pl.DataFrame({"a": [1]}).write_parquet(parquet_path)
+        source = FileSource(str(parquet_path))
+        paths = _materialize_remote_to_parquet(
+            source,
+            str(parquet_path),
+            "parquet",
+            None,
+            {"parquet_output_dir": str(tmp_path / "out")},
+        )
+        assert paths == [str(parquet_path)]
+        assert source.borrowed_paths == {str(parquet_path)}
+
+
 class TestDatabaseSource:
     """Tests for DatabaseSource class."""
 

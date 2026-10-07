@@ -82,9 +82,17 @@ class Pack:
 
         self.figures = FiguresAsset()
 
-        # Initialize paths for cleanup tracking
+        # What the last load_data() call returned, per trigger. Packs read
+        # these as "what I just loaded"; cleanup does NOT use them, see
+        # _staged below.
         self.paths_source = None
         self.paths_target = None
+        # Every parquet part load_data() wrote, across all its calls. Cleanup
+        # deletes these and only these: paths_source keeps the last call
+        # only (a pack loading table by table leaked every earlier table),
+        # and holds the user's own file for a parquet source, which cleanup
+        # used to delete.
+        self._staged: Dict[str, List[str]] = {"source": [], "target": []}
         self.df_source = None
         self.df_target = None
         # Logical object name -> its parquet parts. Built by load_data(). This
@@ -125,14 +133,15 @@ class Pack:
             int: Total number of files removed.
         """
         total_removed = 0
-        if self.paths_source:
-            removed = cleanup_parquet_files(self.paths_source, self.logger)
-            self.logger.debug(f"Cleaned up {removed} source parquet file(s)")
+        for trigger, staged in self._staged.items():
+            if not staged:
+                continue
+            removed = cleanup_parquet_files(staged, self.logger)
+            self.logger.debug(
+                f"Cleaned up {removed} {trigger} parquet file(s)"
+            )
             total_removed += removed
-        if self.paths_target:
-            removed = cleanup_parquet_files(self.paths_target, self.logger)
-            self.logger.debug(f"Cleaned up {removed} target parquet file(s)")
-            total_removed += removed
+            staged.clear()
         if total_removed > 0:
             self.logger.info(
                 f"Cleaned up {total_removed} temporary parquet file(s)"
@@ -208,6 +217,7 @@ class Pack:
             "_trigger": trigger,
         }
         paths = ds.get_data(table_or_query, pack_config=effective_pack_conf)
+        self._track_staged(trigger, ds, paths)
         objects = self._group_by_object(ds, paths)
         skipped_objects = [
             dict(item) for item in getattr(ds, "skipped_objects", [])
@@ -225,6 +235,23 @@ class Pack:
             self.objects_target = objects
             self.skipped_target_objects = skipped_objects
             return self.paths_target
+
+    def _track_staged(self, trigger: str, ds, paths) -> None:
+        """Remember the parts this call wrote, never the source's own files."""
+        staged = self._staged.setdefault(trigger, [])
+        borrowed = {
+            os.path.realpath(path)
+            for path in (getattr(ds, "borrowed_paths", None) or ())
+            if isinstance(path, str)
+        }
+        known = set(staged)
+        for path in paths or []:
+            if not isinstance(path, str) or path in known:
+                continue
+            if os.path.realpath(path) in borrowed:
+                continue
+            staged.append(path)
+            known.add(path)
 
     @staticmethod
     def _group_by_object(ds, paths: List[str]) -> Dict[str, List[str]]:

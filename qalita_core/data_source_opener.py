@@ -31,7 +31,7 @@ import os
 import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
@@ -119,6 +119,20 @@ class DataSource(ABC):
         return existing
 
     @property
+    def borrowed_paths(self) -> Set[str]:
+        """Paths handed back as-is instead of staged: the user's own files.
+
+        A parquet file is already the staging format, so it is returned
+        without a copy. Those paths belong to the source, not to the pack run:
+        ``Pack.cleanup`` must never delete them.
+        """
+        existing = getattr(self, "_borrowed_paths", None)
+        if existing is None:
+            existing = set()
+            self._borrowed_paths = existing
+        return existing
+
+    @property
     def skipped_objects(self) -> List[Dict[str, str]]:
         """Objects skipped by the current multi-object scan."""
         existing = getattr(self, "_skipped_objects", None)
@@ -186,9 +200,14 @@ class DataSource(ABC):
         registry[candidate] = identifier
         return candidate
 
-    def _record_object(self, name: str, paths: List[str]) -> List[str]:
+    def _record_object(
+        self, name: str, paths: List[str], staged: bool = True
+    ) -> List[str]:
+        """Record an object's parts; ``staged=False`` marks borrowed paths."""
         if paths:
             self.object_paths.setdefault(name, []).extend(paths)
+            if not staged:
+                self.borrowed_paths.update(paths)
         return paths
 
 
@@ -831,7 +850,7 @@ class FileSource(DataSource):
 
         # Parquet is already the staging format: no copy, no conversion.
         if lower.endswith((".parquet", ".pq")):
-            return self._record_object(base_name, [file_path])
+            return self._record_object(base_name, [file_path], staged=False)
 
         # Text formats stage to roughly a fifth to a half of their own size
         # once zstd is applied; 0.6 keeps the guard on the safe side of that
@@ -1231,7 +1250,7 @@ def _materialize_remote_to_parquet(
     )
 
     if fmt == "parquet" and not storage_options:
-        return source._record_object(base_name, [path])
+        return source._record_object(base_name, [path], staged=False)
 
     # Polars scans s3/gs/abfs/http in place; anything else (HDFS above all) has
     # to come through fsspec, which streams it to a local file first.
@@ -1916,6 +1935,7 @@ class RedshiftSource(DataSource):
             table_or_query=table_or_query, pack_config=pack_config
         )
         self._object_paths = db_source.object_paths
+        self._borrowed_paths = set(getattr(db_source, "borrowed_paths", ()))
         self._skipped_objects = [
             dict(item) for item in db_source.skipped_objects
         ]
