@@ -1055,10 +1055,145 @@ class TestFolderSource:
         source = FolderSource(config)
         assert source.config == config
 
-    def test_get_data_not_implemented(self):
-        source = FolderSource({})
-        with pytest.raises(NotImplementedError):
-            source.get_data()
+    @staticmethod
+    def _folder(tmp_path):
+        folder = tmp_path / "warehouse"
+        folder.mkdir()
+        (folder / "patients.csv").write_text("id,sex\n1,F\n2,M\n")
+        pl.DataFrame({"stay": [10, 11, 12]}).write_parquet(
+            folder / "stays.parquet"
+        )
+        (folder / "README.md").write_text("not data")
+        (folder / ".hidden.csv").write_text("a\n1\n")
+        (folder / "~$patients.xlsx").write_text("excel lock file")
+        return folder
+
+    @staticmethod
+    def _config(tmp_path):
+        return {"parquet_output_dir": str(tmp_path / "out")}
+
+    def test_every_data_file_is_one_object(self, tmp_path):
+        folder = self._folder(tmp_path)
+        source = FolderSource({"path": str(folder)})
+        paths = source.get_data(pack_config=self._config(tmp_path))
+
+        assert sorted(source.object_paths) == ["file_patients", "file_stays"]
+        assert sorted(paths) == sorted(
+            p for parts in source.object_paths.values() for p in parts
+        )
+        patients = pl.scan_parquet(source.object_paths["file_patients"])
+        assert patients.collect()["sex"].to_list() == ["F", "M"]
+
+    def test_parquet_files_are_read_in_place_and_borrowed(self, tmp_path):
+        folder = self._folder(tmp_path)
+        source = FolderSource({"path": str(folder)})
+        source.get_data(pack_config=self._config(tmp_path))
+        stays = str(folder / "stays.parquet")
+        assert source.object_paths["file_stays"] == [stays]
+        assert source.borrowed_paths == {stays}
+
+    def test_star_selects_everything(self, tmp_path):
+        folder = self._folder(tmp_path)
+        source = FolderSource({"path": str(folder)})
+        source.get_data("*", pack_config=self._config(tmp_path))
+        assert len(source.object_paths) == 2
+
+    def test_select_by_name_with_or_without_extension(self, tmp_path):
+        folder = self._folder(tmp_path)
+        for name in ("patients", "patients.csv", "PATIENTS"):
+            source = FolderSource({"path": str(folder)})
+            source.get_data(name, pack_config=self._config(tmp_path))
+            assert list(source.object_paths) == ["file_patients"], name
+
+    def test_select_a_list(self, tmp_path):
+        folder = self._folder(tmp_path)
+        source = FolderSource({"path": str(folder)})
+        source.get_data(
+            ["stays", "patients"], pack_config=self._config(tmp_path)
+        )
+        assert sorted(source.object_paths) == ["file_patients", "file_stays"]
+
+    def test_unknown_name_lists_what_exists(self, tmp_path):
+        folder = self._folder(tmp_path)
+        source = FolderSource({"path": str(folder)})
+        with pytest.raises(FileNotFoundError, match="patients, stays"):
+            source.get_data("visits", pack_config=self._config(tmp_path))
+
+    def test_missing_or_empty_folder(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            FolderSource({"path": str(tmp_path / "nope")}).get_data(
+                pack_config=self._config(tmp_path)
+            )
+        with pytest.raises(FileNotFoundError):
+            FolderSource({}).get_data(pack_config=self._config(tmp_path))
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        (empty / "notes.txt").write_text("x")
+        with pytest.raises(FileNotFoundError, match="No data file"):
+            FolderSource({"path": str(empty)}).get_data(
+                pack_config=self._config(tmp_path)
+            )
+
+    def test_unreadable_file_is_skipped_in_a_full_scan(self, tmp_path):
+        folder = self._folder(tmp_path)
+        (folder / "broken.parquet").write_text("not parquet at all")
+        (folder / "broken.json").write_text("{ not json")
+        source = FolderSource({"path": str(folder)})
+        source.get_data(pack_config=self._config(tmp_path))
+        assert sorted(source.object_paths) == ["file_patients", "file_stays"]
+        assert sorted(item["object"] for item in source.skipped_objects) == [
+            "broken.json",
+            "broken.parquet",
+        ]
+
+    def test_files_sharing_a_stem_keep_their_suffix(self, tmp_path):
+        folder = tmp_path / "f"
+        folder.mkdir()
+        (folder / "visits.csv").write_text("v\n1\n")
+        pl.DataFrame({"v": [2]}).write_parquet(folder / "visits.parquet")
+        source = FolderSource({"path": str(folder)})
+        source.get_data(pack_config=self._config(tmp_path))
+        assert sorted(source.object_paths) == [
+            "file_visits_csv",
+            "file_visits_parquet",
+        ]
+
+    def test_unreadable_file_selected_by_name_raises(self, tmp_path):
+        folder = self._folder(tmp_path)
+        (folder / "broken.json").write_text("{ not json")
+        source = FolderSource({"path": str(folder)})
+        with pytest.raises(Exception):
+            source.get_data("broken", pack_config=self._config(tmp_path))
+
+    def test_nothing_readable_raises(self, tmp_path):
+        folder = tmp_path / "bad"
+        folder.mkdir()
+        (folder / "a.json").write_text("{ nope")
+        source = FolderSource({"path": str(folder)})
+        with pytest.raises(RuntimeError, match="None of the 1 files"):
+            source.get_data(pack_config=self._config(tmp_path))
+
+    def test_recursive_is_opt_in(self, tmp_path):
+        folder = self._folder(tmp_path)
+        (folder / "2024").mkdir()
+        (folder / "2024" / "visits.csv").write_text("v\n1\n")
+        (folder / ".git").mkdir()
+        (folder / ".git" / "x.csv").write_text("v\n1\n")
+
+        flat = FolderSource({"path": str(folder)})
+        flat.get_data(pack_config=self._config(tmp_path))
+        assert "file_2024_visits" not in flat.object_paths
+
+        deep = FolderSource({"path": str(folder), "recursive": True})
+        deep.get_data(pack_config=self._config(tmp_path))
+        assert sorted(deep.object_paths) == [
+            "file_2024_visits",
+            "file_patients",
+            "file_stays",
+        ]
+        deep_again = FolderSource({"path": str(folder), "recursive": True})
+        deep_again.get_data("2024/visits", pack_config=self._config(tmp_path))
+        assert list(deep_again.object_paths) == ["file_2024_visits"]
 
 
 class TestMongoDBSource:

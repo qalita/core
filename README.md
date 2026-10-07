@@ -24,11 +24,16 @@ pandas is **optional** (`pip install qalita_core[pandas]`): importing
 ## Supported sources
 
 - Files: CSV (`.csv`), Excel (`.xlsx`), JSON, Parquet (pass-through)
+- Folders (`type: "folder"`): every data file of a directory, one logical
+  object per file (`config.path`, optional `config.recursive`); select files
+  with `table_or_query` (`"*"`, a name, or a list), unreadable files are
+  skipped and listed in `skipped_objects`
 - Databases: PostgreSQL, MySQL, Oracle, MS SQL Server, SQLite
 - Object storage: Amazon S3, Google Cloud Storage, Azure Blob (via `abfs`), HDFS
 
 Notes:
-- Folder, MongoDB classes exist as placeholders; MongoDB is not yet implemented.
+- A `file` source pointed at a directory still loads its first file only; use
+  `type: "folder"` to load all of them.
 - SQLite is supported through the generic `DatabaseSource` when selected via `type: "sqlite"`.
 
 ## Installation

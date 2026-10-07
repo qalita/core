@@ -817,6 +817,32 @@ class TestCleanupCoversEveryLoad:
         assert database.exists()
 
 
+class TestFolderSourceThroughPack:
+    """A folder is a multi-object source, like a database scanned with *."""
+
+    def test_tables_scan_and_cleanup(self, tmp_path):
+        folder = tmp_path / "warehouse"
+        folder.mkdir()
+        (folder / "patients.csv").write_text("id\n1\n2\n")
+        stays = folder / "stays.parquet"
+        pl.DataFrame({"stay": [10]}).write_parquet(stays)
+
+        with _pack_for(
+            tmp_path, {"type": "folder", "config": {"path": str(folder)}}
+        ) as pack:
+            pack.load_data("source")
+            assert sorted(pack.tables("source")) == [
+                "file_patients",
+                "file_stays",
+            ]
+            assert pack.get_row_count("source", "file_patients") == 2
+            assert pack.schema("source", "file_stays") == {"stay": pl.Int64}
+            staged = pack.objects_source["file_patients"]
+
+        assert stays.exists() and (folder / "patients.csv").exists()
+        assert not any(os.path.exists(p) for p in staged)
+
+
 class TestObjectKey:
     """Tests for the _object_key helper."""
 
