@@ -924,12 +924,56 @@ class FileSource(DataSource):
         )
 
 
+def _libpq_escape(value):
+    """Escape a value for the libpq ``options`` startup parameter.
+
+    libpq splits ``options`` on whitespace; a backslash keeps the next
+    character literal, so backslashes and whitespace get one in front.
+    """
+    return "".join(
+        "\\" + char if char == "\\" or char.isspace() else char
+        for char in value
+    )
+
+
+def _postgres_session_options(config):
+    """libpq ``options`` applying the configured ``role`` / ``search_path``.
+
+    The server runs ``-c role=...`` and ``-c search_path=...`` as the session
+    defaults of every new connection, so they survive ``RESET ROLE`` and a
+    role that is not granted to the login fails the connection itself.
+    Returns None when neither key holds a non-blank value.
+    """
+    parts = []
+    for key in ("role", "search_path"):
+        value = (config or {}).get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            parts.append(f"-c {key}={_libpq_escape(value)}")
+    return " ".join(parts) or None
+
+
 class DatabaseSource(_SqlAlchemySource):
     def __init__(self, connection_string=None, config=None):
         # Keep the config available for schema preference and other options
         self.config = config or {}
 
         if connection_string:
+            # Subclasses pass the URL they built as connection_string; only a
+            # connection_string written in the config overrides role/path.
+            explicit = self.config.get("connection_string")
+            if (
+                explicit
+                and str(explicit).lower().startswith("postgres")
+                and _postgres_session_options(self.config)
+            ):
+                logger.warning(
+                    "role/search_path are ignored because connection_string "
+                    "takes precedence; add the libpq 'options' parameter "
+                    "to the connection string instead"
+                )
             self.engine = create_engine(connection_string)
         elif config:
             db_type = config.get("type") or DEFAULT_PORTS.get(
@@ -962,6 +1006,11 @@ class DatabaseSource(_SqlAlchemySource):
                     )
                 self.engine = create_engine(url)
             else:
+                query = {}
+                if db_type.startswith("postgresql"):
+                    options = _postgres_session_options(config)
+                    if options:
+                        query["options"] = options
                 # Use URL.create to avoid password-in-URL pattern detection
                 url = URL.create(
                     drivername=db_type,
@@ -970,6 +1019,7 @@ class DatabaseSource(_SqlAlchemySource):
                     host=config["host"],
                     port=config["port"],
                     database=config["database"],
+                    query=query,
                 )
                 self.engine = create_engine(url)
         else:
