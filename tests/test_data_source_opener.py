@@ -323,6 +323,106 @@ class TestDatabaseSource:
         assert source._is_sql_query("SELECT;multiple") is True
 
 
+def _pg_config(**extra):
+    config = {
+        "type": "postgresql",
+        "host": "db.example.com",
+        "port": 5432,
+        "username": "login_user",
+        "password": "secret",
+        "database": "warehouse",
+    }
+    config.update(extra)
+    return config
+
+
+def _connect_kwargs(source):
+    """What SQLAlchemy hands to the DBAPI connect(), without connecting."""
+    engine = source.engine
+    return engine.dialect.create_connect_args(engine.url)[1]
+
+
+class TestPostgresSessionOptions:
+    """role / search_path reach libpq as the ``options`` startup parameter."""
+
+    def test_role_and_search_path_become_libpq_options(self):
+        source = DatabaseSource(
+            config=_pg_config(
+                role="app_reader", search_path="analytics,public"
+            )
+        )
+
+        assert (
+            _connect_kwargs(source)["options"]
+            == "-c role=app_reader -c search_path=analytics,public"
+        )
+
+    def test_whitespace_and_backslash_are_escaped_for_libpq(self):
+        source = DatabaseSource(
+            config=_pg_config(role="app reader", search_path="a\\b, public")
+        )
+
+        assert (
+            _connect_kwargs(source)["options"]
+            == "-c role=app\\ reader -c search_path=a\\\\b,\\ public"
+        )
+
+    def test_values_are_stripped_and_blank_values_skipped(self):
+        source = DatabaseSource(
+            config=_pg_config(role="  app_reader ", search_path="   ")
+        )
+
+        assert _connect_kwargs(source)["options"] == "-c role=app_reader"
+
+    def test_no_role_and_no_search_path_gives_no_options(self):
+        source = DatabaseSource(config=_pg_config())
+
+        assert "options" not in _connect_kwargs(source)
+
+    def test_non_postgresql_driver_ignores_the_role(self):
+        # Never the bare "mysql" driver: it needs MySQLdb, which is absent.
+        config = _pg_config(type="mysql+pymysql", port=3306, role="app_reader")
+
+        source = DatabaseSource(config=config)
+
+        assert "options" not in _connect_kwargs(source)
+        assert "options" not in source.engine.url.query
+
+    def test_explicit_connection_string_wins_and_warns(self, caplog):
+        connection_string = "postgresql://login_user@db.example.com/warehouse"
+        config = {"connection_string": connection_string, "role": "app_reader"}
+
+        with caplog.at_level(
+            logging.WARNING, logger="qalita_core.data_source_opener"
+        ):
+            source = DatabaseSource(
+                connection_string=connection_string, config=config
+            )
+
+        assert "options" not in source.engine.url.query
+        assert any(
+            "connection_string takes precedence" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_built_connection_string_from_a_subclass_does_not_warn(
+        self, caplog
+    ):
+        # RedshiftSource hands the URL it built as connection_string.
+        with caplog.at_level(
+            logging.WARNING, logger="qalita_core.data_source_opener"
+        ):
+            DatabaseSource(
+                connection_string="postgresql://u@host/db",
+                config={"role": "app_reader"},
+            )
+
+        assert not any(
+            "takes precedence" in record.getMessage()
+            for record in caplog.records
+        )
+
+
 def _make_scan_db(path, readable=("alpha", "beta"), unreadable=("forbidden",)):
     """A database with real readable tables and catalog-visible broken views.
 
@@ -854,6 +954,59 @@ class TestGetDataSource:
         }
         source = get_data_source(source_config)
         assert isinstance(source, DatabaseSource)
+
+    def test_postgresql_driver_comes_from_the_source_type(self):
+        # Platform-registered sources carry the type at the top level only;
+        # port 5433 maps to "greenplum" in DEFAULT_PORTS.
+        source_config = {
+            "type": "postgresql",
+            "config": {
+                "host": "db.example.com",
+                "port": 5433,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+                "role": "app_reader",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.get_backend_name() == "postgresql"
+        assert _connect_kwargs(source)["options"] == "-c role=app_reader"
+
+    def test_postgresql_driver_keeps_an_explicit_config_type(self):
+        source_config = {
+            "type": "postgresql",
+            "config": {
+                "type": "postgresql+psycopg2",
+                "host": "db.example.com",
+                "port": 6432,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.drivername == "postgresql+psycopg2"
+
+    def test_mssql_driver_still_comes_from_the_default_port(self):
+        source_config = {
+            "type": "mssql",
+            "config": {
+                "host": "db.example.com",
+                "port": 1433,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.drivername == "mssql+pymssql"
 
     def test_mysql_source(self):
         """Test MySQL source creation (skipped if MySQLdb not available)."""
