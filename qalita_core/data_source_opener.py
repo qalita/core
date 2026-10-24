@@ -3044,9 +3044,11 @@ def get_data_source(source_config):
 
     # Traditional relational databases (via SQLAlchemy)
     elif type_ == "postgresql":
+        # The source type wins over the port guess (5433 maps to greenplum,
+        # poolers such as 6432 are unknown).
         return DatabaseSource(
             connection_string=config.get("connection_string"),
-            config=config,
+            config={**config, "type": config.get("type") or "postgresql"},
         )
     elif type_ == "mysql":
         return DatabaseSource(

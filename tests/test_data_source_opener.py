@@ -955,6 +955,59 @@ class TestGetDataSource:
         source = get_data_source(source_config)
         assert isinstance(source, DatabaseSource)
 
+    def test_postgresql_driver_comes_from_the_source_type(self):
+        # Platform-registered sources carry the type at the top level only;
+        # port 5433 maps to "greenplum" in DEFAULT_PORTS.
+        source_config = {
+            "type": "postgresql",
+            "config": {
+                "host": "db.example.com",
+                "port": 5433,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+                "role": "app_reader",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.get_backend_name() == "postgresql"
+        assert _connect_kwargs(source)["options"] == "-c role=app_reader"
+
+    def test_postgresql_driver_keeps_an_explicit_config_type(self):
+        source_config = {
+            "type": "postgresql",
+            "config": {
+                "type": "postgresql+psycopg2",
+                "host": "db.example.com",
+                "port": 6432,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.drivername == "postgresql+psycopg2"
+
+    def test_mssql_driver_still_comes_from_the_default_port(self):
+        source_config = {
+            "type": "mssql",
+            "config": {
+                "host": "db.example.com",
+                "port": 1433,
+                "username": "login_user",
+                "password": "secret",
+                "database": "warehouse",
+            },
+        }
+
+        source = get_data_source(source_config)
+
+        assert source.engine.url.drivername == "mssql+pymssql"
+
     def test_mysql_source(self):
         """Test MySQL source creation (skipped if MySQLdb not available)."""
         pytest.importorskip("MySQLdb", reason="MySQLdb not available")
