@@ -33,7 +33,7 @@ dependencies = [
     # breaks their metric history, and it drops String->Date casting that the
     # packs rely on. CI installs with pip, not from uv.lock, so without the
     # ceiling it picked 2.0.0 up the day it shipped. Lift it with a migration.
-    "polars>=1.30.0,<2",
+    "polars>=1.30.0,<3",
     "sqlalchemy>=2.0.27",
     "pyarrow>=19.0.0",
     "openpyxl>=3.1.2",
