@@ -57,13 +57,27 @@ def test_profile_of_an_empty_schema_is_empty():
     assert profiling.profile(pl.LazyFrame({})) == {}
 
 
+def _assert_same_profile(actual, expected, path="profile"):
+    """Equal, floats within 1e-12: the streaming engine sums in parallel,
+    so a mean or std can differ in the last bit from one run to the next."""
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), path
+        assert actual.keys() == expected.keys(), path
+        for key, value in expected.items():
+            _assert_same_profile(actual[key], value, f"{path}.{key}")
+    elif isinstance(expected, float) and not isinstance(expected, bool):
+        assert actual == pytest.approx(expected, rel=1e-12, nan_ok=True), path
+    else:
+        assert actual == expected, path
+
+
 def test_profile_accepts_a_precomputed_schema(small_dataset):
     schema = dict(small_dataset.scan().collect_schema())
     from_footer = profiling.profile(small_dataset.scan(), top_k=0)
     from_schema = profiling.profile(
         small_dataset.scan(), schema=schema, top_k=0
     )
-    assert from_schema == from_footer
+    _assert_same_profile(from_schema, from_footer)
 
 
 # --------------------------------------------------------------------------
