@@ -10,6 +10,12 @@ updates:
     labels:
       - "dependencies"
       - "python"
+    # polars is capped below 2 on purpose: 2.x renames the columns of
+    # header-less CSV sources and drops String->Date casting. Lifting the
+    # cap needs a migration, not a bump.
+    ignore:
+      - dependency-name: "polars"
+        update-types: ["version-update:semver-major"]
     # One grouped PR carries a single coherent uv.lock resolution. Merging
     # ungrouped lockfile PRs in sequence replays stale diffs onto a moved
     # base, which git merges without conflict but leaves inconsistent.
